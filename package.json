@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@vapi-ai/server-sdk": "^0.9.1",
     "@vapi-ai/web": "^2.3.6",
     "next": "15.3.3",
     "react": "^19.0.0",

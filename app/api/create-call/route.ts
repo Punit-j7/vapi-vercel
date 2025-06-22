@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
         },
       }),
     });
-
+    console.log(vapiRes)
     if (!vapiRes.ok) {
       const errJson = await vapiRes.json();
       throw new Error(errJson.error || `HTTP ${vapiRes.status}`);

@@ -1,7 +1,7 @@
 "use client";
-// VoiceAgent.tsx – WebSocket‑only, 16 kHz PCM two‑way audio (no SDK)
+// VoiceAgent.tsx – improved: ensures first assistant sentence is not clipped
 //---------------------------------------------------------------------
-import React, { useEffect, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 
 interface CallResponse {
   callId: string;
@@ -9,17 +9,22 @@ interface CallResponse {
   error?: string;
 }
 
-const SAMPLE_RATE_TX = 16000; // Hz
+const SAMPLE_RATE_TX = 16000;
 
 const VoiceAgent: React.FC = () => {
+  /* ───── React state ───── */
   const [isConnecting, setIsConnecting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /* ───── refs for long‑lived objects ───── */
   const wsRef = useRef<WebSocket | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef<number>(0);
+  const workletLoadedRef = useRef(false);
 
+  /* ───── helpers ───── */
   const floatTo16LE = (input: Float32Array) => {
     const out = new Int16Array(input.length);
     for (let i = 0; i < input.length; i++) {
@@ -29,71 +34,70 @@ const VoiceAgent: React.FC = () => {
     return out.buffer;
   };
 
-  const nextPlayTimeRef = useRef<number>(0);
-
   const playPcmChunk = (buf: ArrayBuffer) => {
     const ctx = audioCtxRef.current;
     if (!ctx) return;
 
+    /* convert Int16 → Float32 [-1..1] */
     const int16 = new Int16Array(buf);
     const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 0x8000;
-    }
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
 
+    /* wrap in AudioBuffer */
     const audioBuf = ctx.createBuffer(1, float32.length, SAMPLE_RATE_TX);
     audioBuf.getChannelData(0).set(float32);
 
+    /* create one‑shot source */
     const src = ctx.createBufferSource();
     src.buffer = audioBuf;
     src.connect(ctx.destination);
 
-    if (nextPlayTimeRef.current < ctx.currentTime + 0.05) {
-      nextPlayTimeRef.current = ctx.currentTime + 0.05;
+    /* queue play time – start immediately for very first chunk */
+    if (nextPlayTimeRef.current < ctx.currentTime) {
+      nextPlayTimeRef.current = ctx.currentTime;
     }
 
     src.start(nextPlayTimeRef.current);
     nextPlayTimeRef.current += audioBuf.duration;
   };
 
+  /* ───── mic capture / encoder ───── */
   const startMicCapture = async (socket: WebSocket) => {
+    let ctx = audioCtxRef.current;
+    if (!ctx) {
+      ctx = new AudioContext({ sampleRate: 48000 });
+      await ctx.resume();
+      audioCtxRef.current = ctx;
+    }
+
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const ctx = new AudioContext({ sampleRate: 48000 });
-    audioCtxRef.current = ctx;
 
     const recorderWorklet = `class PCMProcessor extends AudioWorkletProcessor {
-      constructor() {
-        super();
-        this._buf = [];
-      }
-      process(inputs) {
-        if (!inputs[0][0]) return true;
-        const input = inputs[0][0];
-        this._buf.push(new Float32Array(input));
-        if (this._buf.length >= 12) {
-          // ~32 ms buffer for smoother send
-          let merged = new Float32Array(this._buf.length * 128);
-          this._buf.forEach((c, i) => merged.set(c, i * 128));
-          this._buf = [];
-
-          const factor = 3; // 48k → 16k
-          const down = new Float32Array(merged.length / factor);
-          for (let i = 0; i < down.length; i++) {
-            const idx = i * factor;
-            const i1 = Math.floor(idx);
-            const i2 = Math.min(i1 + 1, merged.length - 1);
-            const frac = idx - i1;
-            down[i] = merged[i1] * (1 - frac) + merged[i2] * frac;
+      constructor(){ super(); this._buf=[]; }
+      process(inputs){
+        if(!inputs[0][0]) return true;
+        this._buf.push(new Float32Array(inputs[0][0]));
+        if(this._buf.length>=12){
+          const merged=new Float32Array(this._buf.length*128);
+          this._buf.forEach((c,i)=>merged.set(c,i*128));
+          this._buf=[];
+          const down=new Float32Array(merged.length/3);
+          for(let i=0;i<down.length;i++){
+            const idx=i*3; const i1=idx|0; const frac=idx-i1;
+            down[i]=merged[i1]*(1-frac)+merged[Math.min(i1+1,merged.length-1)]*frac;
           }
           this.port.postMessage(down);
         }
         return true;
       }
-    }
-    registerProcessor('pcm-processor', PCMProcessor);`;
+    };
+    registerProcessor('pcm-processor',PCMProcessor);`;
 
-    const blobURL = URL.createObjectURL(new Blob([recorderWorklet], { type: 'application/javascript' }));
-    await ctx.audioWorklet.addModule(blobURL);
+    if (!workletLoadedRef.current) {
+      const blobURL = URL.createObjectURL(new Blob([recorderWorklet], { type: 'application/javascript' }));
+      await ctx.audioWorklet.addModule(blobURL);
+      workletLoadedRef.current = true;
+    }
 
     const src = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'pcm-processor');
@@ -101,8 +105,7 @@ const VoiceAgent: React.FC = () => {
 
     node.port.onmessage = (e) => {
       if (socket.readyState === WebSocket.OPEN) {
-        const pcmBuffer = floatTo16LE(e.data as Float32Array);
-        socket.send(pcmBuffer);
+        socket.send(floatTo16LE(e.data as Float32Array));
       }
     };
 
@@ -114,6 +117,7 @@ const VoiceAgent: React.FC = () => {
     audioCtxRef.current?.close();
     workletNodeRef.current = null;
     audioCtxRef.current = null;
+    nextPlayTimeRef.current = 0;
   };
 
   const toggleCall = async () => {
@@ -126,6 +130,11 @@ const VoiceAgent: React.FC = () => {
     try {
       setIsConnecting(true);
       setError(null);
+
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioContext({ sampleRate: 48000 });
+        await audioCtxRef.current.resume();
+      }
 
       const res = await fetch('/api/create-call', { method: 'POST' });
       const data = (await res.json()) as CallResponse;

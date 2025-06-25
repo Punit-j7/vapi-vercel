@@ -1,5 +1,5 @@
 "use client";
-// VoiceAgent.tsx – improved: ensures first assistant sentence is not clipped
+// VoiceAgent.tsx – fixes reconnect issue by always re‑loading worklet on new AudioContext
 //---------------------------------------------------------------------
 import React, { useRef, useState } from "react";
 
@@ -14,15 +14,14 @@ const SAMPLE_RATE_TX = 16000;
 const VoiceAgent: React.FC = () => {
   /* ───── React state ───── */
   const [isConnecting, setIsConnecting] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [isConnected, setIsConnected]   = useState(false);
+  const [error,        setError]        = useState<string | null>(null);
 
-  /* ───── refs for long‑lived objects ───── */
-  const wsRef = useRef<WebSocket | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const nextPlayTimeRef = useRef<number>(0);
-  const workletLoadedRef = useRef(false);
+  /* ───── persistent refs ───── */
+  const wsRef             = useRef<WebSocket | null>(null);
+  const workletNodeRef    = useRef<AudioWorkletNode | null>(null);
+  const audioCtxRef       = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef   = useRef<number>(0);
 
   /* ───── helpers ───── */
   const floatTo16LE = (input: Float32Array) => {
@@ -38,21 +37,17 @@ const VoiceAgent: React.FC = () => {
     const ctx = audioCtxRef.current;
     if (!ctx) return;
 
-    /* convert Int16 → Float32 [-1..1] */
-    const int16 = new Int16Array(buf);
+    const int16   = new Int16Array(buf);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
 
-    /* wrap in AudioBuffer */
     const audioBuf = ctx.createBuffer(1, float32.length, SAMPLE_RATE_TX);
     audioBuf.getChannelData(0).set(float32);
 
-    /* create one‑shot source */
     const src = ctx.createBufferSource();
     src.buffer = audioBuf;
     src.connect(ctx.destination);
 
-    /* queue play time – start immediately for very first chunk */
     if (nextPlayTimeRef.current < ctx.currentTime) {
       nextPlayTimeRef.current = ctx.currentTime;
     }
@@ -72,34 +67,14 @@ const VoiceAgent: React.FC = () => {
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-    const recorderWorklet = `class PCMProcessor extends AudioWorkletProcessor {
-      constructor(){ super(); this._buf=[]; }
-      process(inputs){
-        if(!inputs[0][0]) return true;
-        this._buf.push(new Float32Array(inputs[0][0]));
-        if(this._buf.length>=12){
-          const merged=new Float32Array(this._buf.length*128);
-          this._buf.forEach((c,i)=>merged.set(c,i*128));
-          this._buf=[];
-          const down=new Float32Array(merged.length/3);
-          for(let i=0;i<down.length;i++){
-            const idx=i*3; const i1=idx|0; const frac=idx-i1;
-            down[i]=merged[i1]*(1-frac)+merged[Math.min(i1+1,merged.length-1)]*frac;
-          }
-          this.port.postMessage(down);
-        }
-        return true;
-      }
-    };
-    registerProcessor('pcm-processor',PCMProcessor);`;
+    /* inline worklet code */
+    const recorderWorklet = `class PCMProcessor extends AudioWorkletProcessor {\n      constructor(){ super(); this._buf=[]; }\n      process(inputs){\n        if(!inputs[0][0]) return true;\n        this._buf.push(new Float32Array(inputs[0][0]));\n        if(this._buf.length>=12){\n          const merged=new Float32Array(this._buf.length*128);\n          this._buf.forEach((c,i)=>merged.set(c,i*128));\n          this._buf=[];\n          const down=new Float32Array(merged.length/3);\n          for(let i=0;i<down.length;i++){\n            const idx=i*3; const i1=idx|0; const frac=idx-i1;\n            down[i]=merged[i1]*(1-frac)+merged[Math.min(i1+1,merged.length-1)]*frac;\n          }\n          this.port.postMessage(down);\n        }\n        return true;\n      }\n    };\n    registerProcessor('pcm-processor',PCMProcessor);`;
 
-    if (!workletLoadedRef.current) {
-      const blobURL = URL.createObjectURL(new Blob([recorderWorklet], { type: 'application/javascript' }));
-      await ctx.audioWorklet.addModule(blobURL);
-      workletLoadedRef.current = true;
-    }
+    /* Always load module for each (new) AudioContext */
+    const blobURL = URL.createObjectURL(new Blob([recorderWorklet], { type: 'application/javascript' }));
+    await ctx.audioWorklet.addModule(blobURL);
 
-    const src = ctx.createMediaStreamSource(stream);
+    const src  = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'pcm-processor');
     workletNodeRef.current = node;
 
@@ -116,10 +91,11 @@ const VoiceAgent: React.FC = () => {
     workletNodeRef.current?.disconnect();
     audioCtxRef.current?.close();
     workletNodeRef.current = null;
-    audioCtxRef.current = null;
-    nextPlayTimeRef.current = 0;
+    audioCtxRef.current    = null;
+    nextPlayTimeRef.current = 0; // reset playback timeline
   };
 
+  /* ───── toggle button ───── */
   const toggleCall = async () => {
     if (isConnected) {
       wsRef.current?.close();
@@ -127,6 +103,7 @@ const VoiceAgent: React.FC = () => {
       setIsConnected(false);
       return;
     }
+
     try {
       setIsConnecting(true);
       setError(null);
@@ -136,7 +113,7 @@ const VoiceAgent: React.FC = () => {
         await audioCtxRef.current.resume();
       }
 
-      const res = await fetch('/api/create-call', { method: 'POST' });
+      const res  = await fetch('/api/create-call', { method: 'POST' });
       const data = (await res.json()) as CallResponse;
       if (data.error) throw new Error(data.error);
 
@@ -174,6 +151,7 @@ const VoiceAgent: React.FC = () => {
     }
   };
 
+  /* ───── render ───── */
   const btnText = isConnecting ? 'Connecting…' : isConnected ? 'End Call' : 'Start Call';
 
   return (

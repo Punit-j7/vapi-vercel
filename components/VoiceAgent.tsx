@@ -1,6 +1,5 @@
 "use client";
-// VoiceAgent.tsx – fixes reconnect issue by always re‑loading worklet on new AudioContext
-//---------------------------------------------------------------------
+
 import React, { useRef, useState } from "react";
 
 interface CallResponse {

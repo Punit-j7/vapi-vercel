@@ -1,5 +1,6 @@
 "use client";
-
+// VoiceAgent.tsx – fixes reconnect issue by always re‑loading worklet on new AudioContext
+//---------------------------------------------------------------------
 import React, { useRef, useState } from "react";
 
 interface CallResponse {
@@ -20,6 +21,7 @@ const VoiceAgent: React.FC = () => {
   const wsRef             = useRef<WebSocket | null>(null);
   const workletNodeRef    = useRef<AudioWorkletNode | null>(null);
   const audioCtxRef       = useRef<AudioContext | null>(null);
+  const micStreamRef      = useRef<MediaStream | null>(null);
   const nextPlayTimeRef   = useRef<number>(0);
 
   /* ───── helpers ───── */
@@ -65,6 +67,7 @@ const VoiceAgent: React.FC = () => {
     }
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStreamRef.current = stream;
 
     /* inline worklet code */
     const recorderWorklet = `class PCMProcessor extends AudioWorkletProcessor {\n      constructor(){ super(); this._buf=[]; }\n      process(inputs){\n        if(!inputs[0][0]) return true;\n        this._buf.push(new Float32Array(inputs[0][0]));\n        if(this._buf.length>=12){\n          const merged=new Float32Array(this._buf.length*128);\n          this._buf.forEach((c,i)=>merged.set(c,i*128));\n          this._buf=[];\n          const down=new Float32Array(merged.length/3);\n          for(let i=0;i<down.length;i++){\n            const idx=i*3; const i1=idx|0; const frac=idx-i1;\n            down[i]=merged[i1]*(1-frac)+merged[Math.min(i1+1,merged.length-1)]*frac;\n          }\n          this.port.postMessage(down);\n        }\n        return true;\n      }\n    };\n    registerProcessor('pcm-processor',PCMProcessor);`;
@@ -87,6 +90,11 @@ const VoiceAgent: React.FC = () => {
   };
 
   const stopMicCapture = () => {
+    // ① stop microphone tracks completely
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
+
+    // ② disconnect worklet and close AudioContext
     workletNodeRef.current?.disconnect();
     audioCtxRef.current?.close();
     workletNodeRef.current = null;
